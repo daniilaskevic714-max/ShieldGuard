@@ -1,8 +1,11 @@
 package com.example.data.database
 
-import androidx.room.*
-import com.example.data.model.BlockedWebsite
-import com.example.data.model.QuarantinedItem
+import androidx.room.Dao
+import androidx.room.Delete
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import com.example.data.model.GlobalBlacklist
 import com.example.data.model.ScanReport
 import com.example.data.model.TrustedApp
 import kotlinx.coroutines.flow.Flow
@@ -24,7 +27,7 @@ interface ShieldGuardDao {
     suspend fun deleteTrustedAppByPackage(packageName: String)
 
     // Scan Reports
-    @Query("SELECT * FROM scan_reports ORDER BY timestamp DESC")
+    @Query("SELECT * FROM scan_reports ORDER BY timestamp DESC LIMIT 50")
     fun getAllScanReports(): Flow<List<ScanReport>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -33,26 +36,19 @@ interface ShieldGuardDao {
     @Query("DELETE FROM scan_reports")
     suspend fun deleteAllReports()
 
-    // Quarantined Items
-    @Query("SELECT * FROM quarantined_items ORDER BY detectedDate DESC")
-    fun getAllQuarantinedItems(): Flow<List<QuarantinedItem>>
+    // Global Blacklist (Abuse.ch MalwareBazaar SHA-256 hashes)
+    @Query("SELECT COUNT(*) FROM global_blacklist")
+    fun getBlacklistedCountFlow(): Flow<Int>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertQuarantinedItem(item: QuarantinedItem): Long
+    @Query("SELECT sha256_hash FROM global_blacklist")
+    suspend fun getAllBlacklistedHashStrings(): List<String>
 
-    @Delete
-    suspend fun deleteQuarantinedItem(item: QuarantinedItem)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertBlacklistedHashes(hashes: List<GlobalBlacklist>)
 
-    @Query("DELETE FROM quarantined_items WHERE id = :id")
-    suspend fun deleteQuaranteedById(id: Long)
+    @Query("DELETE FROM global_blacklist")
+    suspend fun clearAllBlacklistedHashes()
 
-    // Blocked Websites
-    @Query("SELECT * FROM blocked_websites ORDER BY addedDate DESC")
-    fun getAllBlockedWebsites(): Flow<List<BlockedWebsite>>
-
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertBlockedWebsite(website: BlockedWebsite)
-
-    @Delete
-    suspend fun deleteBlockedWebsite(website: BlockedWebsite)
+    @Query("SELECT EXISTS(SELECT 1 FROM global_blacklist WHERE sha256_hash = :hash)")
+    suspend fun isHashBlacklisted(hash: String): Boolean
 }

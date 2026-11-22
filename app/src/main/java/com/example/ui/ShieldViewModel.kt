@@ -1,360 +1,341 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.Constraints
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import com.example.data.database.ShieldGuardDatabase
-import com.example.data.model.BlockedWebsite
-import com.example.data.model.QuarantinedItem
+import com.example.data.model.AppAuditInfo
+import com.example.data.model.DevicePostureReport
+import com.example.data.model.FileInspectionResult
 import com.example.data.model.ScanReport
+import com.example.data.model.SensitivityLevel
+import com.example.data.model.SignatureSyncState
 import com.example.data.model.TrustedApp
-import com.example.data.repository.AppSecurityInfo
-import com.example.data.repository.CacheData
 import com.example.data.repository.SecurityRepository
-import com.example.service.ShieldGuardService
+import com.example.service.SignatureUpdateWorker
 import com.example.widget.ShieldGuardWidgetProvider
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.File
-import kotlin.random.Random
 
 class ShieldViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = ShieldGuardDatabase.getDatabase(application)
     private val repository = SecurityRepository(application, db.shieldGuardDao())
+    private val prefs = application.getSharedPreferences(SignatureUpdateWorker.PREFS_NAME, Context.MODE_PRIVATE)
 
-    // Database streams
     val reportsList: StateFlow<List<ScanReport>> = repository.allReports
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    val quarantineList: StateFlow<List<QuarantinedItem>> = repository.quarantinedItems
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-
-    val websitesList: StateFlow<List<BlockedWebsite>> = repository.blockedWebsites
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val trustedAppsList: StateFlow<List<TrustedApp>> = repository.trustedApps
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // UI Scanning state
+    private val _isSyncingSignatures = MutableStateFlow(false)
+    private val _syncError = MutableStateFlow<String?>(prefs.getString(SignatureUpdateWorker.KEY_LAST_SYNC_ERROR, null))
+    private val _lastSyncTimeMs = MutableStateFlow(prefs.getLong(SignatureUpdateWorker.KEY_LAST_SYNC_TIME, 0L))
+
+    val signatureSyncState: StateFlow<SignatureSyncState> = combine(
+        repository.blacklistedCount,
+        _lastSyncTimeMs,
+        _isSyncingSignatures,
+        _syncError
+    ) { count, lastSync, syncing, err ->
+        SignatureSyncState(
+            count = count,
+            lastSyncTimeMs = lastSync,
+            isSyncing = syncing,
+            lastError = err
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SignatureSyncState())
+
+    private val _auditedApps = MutableStateFlow<List<AppAuditInfo>>(emptyList())
+    val auditedApps: StateFlow<List<AppAuditInfo>> = _auditedApps.asStateFlow()
+
+    private val _postureReport = MutableStateFlow<DevicePostureReport?>(null)
+    val postureReport: StateFlow<DevicePostureReport?> = _postureReport.asStateFlow()
+
+    private val _isLoadingApps = MutableStateFlow(true)
+    val isLoadingApps: StateFlow<Boolean> = _isLoadingApps.asStateFlow()
+
     private val _isScanning = MutableStateFlow(false)
-    val isScanning = _isScanning.asStateFlow()
+    val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
     private val _scanProgress = MutableStateFlow(0f)
-    val scanProgress = _scanProgress.asStateFlow()
+    val scanProgress: StateFlow<Float> = _scanProgress.asStateFlow()
 
-    private val _scannedFilesCount = MutableStateFlow(0)
-    val scannedFilesCount = _scannedFilesCount.asStateFlow()
+    private val _scannedCount = MutableStateFlow(0)
+    val scannedCount: StateFlow<Int> = _scannedCount.asStateFlow()
 
-    private val _currentScannedFile = MutableStateFlow("")
-    val currentScannedFile = _currentScannedFile.asStateFlow()
+    private val _totalToScan = MutableStateFlow(0)
+    val totalToScan: StateFlow<Int> = _totalToScan.asStateFlow()
 
-    private val _activeThreatsFound = MutableStateFlow<List<QuarantinedItem>>(emptyList())
-    val activeThreatsFound = _activeThreatsFound.asStateFlow()
+    private val _currentScanTarget = MutableStateFlow("")
+    val currentScanTarget: StateFlow<String> = _currentScanTarget.asStateFlow()
 
-    // Cache clean state
-    private val _cacheState = MutableStateFlow<CacheData?>(null)
-    val cacheState = _cacheState.asStateFlow()
+    private val _lastScanBanner = MutableStateFlow<String?>(null)
+    val lastScanBanner: StateFlow<String?> = _lastScanBanner.asStateFlow()
 
-    private val _isCleaning = MutableStateFlow(false)
-    val isCleaning = _isCleaning.asStateFlow()
+    private val _isInspectingFile = MutableStateFlow(false)
+    val isInspectingFile: StateFlow<Boolean> = _isInspectingFile.asStateFlow()
 
-    private val _clearedAmount = MutableStateFlow<Float?>(null)
-    val clearedAmount = _clearedAmount.asStateFlow()
+    private val _fileInspectionResult = MutableStateFlow<FileInspectionResult?>(null)
+    val fileInspectionResult: StateFlow<FileInspectionResult?> = _fileInspectionResult.asStateFlow()
 
-    // App permission list state
-    private val _installedApps = MutableStateFlow<List<AppSecurityInfo>>(emptyList())
-    val installedApps = _installedApps.asStateFlow()
+    private val _fileInspectionError = MutableStateFlow<String?>(null)
+    val fileInspectionError: StateFlow<String?> = _fileInspectionError.asStateFlow()
 
-    // Settings States
-    val isRealTimeScannerActive = MutableStateFlow(true)
-    val isRiskNotificationsEnabled = MutableStateFlow(true)
-    val areBackgroundScansEnabled = MutableStateFlow(true)
-    val isLowBatteryModeActive = MutableStateFlow(false)
-    val scannerSensitivity = MutableStateFlow("Medium") // "Low", "Medium", "High"
+    private val _sensitivity = MutableStateFlow(
+        SensitivityLevel.entries.find {
+            it.key == prefs.getString("scanner_sensitivity", SensitivityLevel.MEDIUM.key)
+        } ?: SensitivityLevel.MEDIUM
+    )
+    val sensitivity: StateFlow<SensitivityLevel> = _sensitivity.asStateFlow()
+
+    private var activeScanJob: Job? = null
 
     init {
-        viewModelScope.launch {
-            repository.initDefaultBlockedWebsites()
-            refreshCacheUsage()
-            refreshAppPermissions()
-            
-            // Auto start service with respect to setting
-            if (isRealTimeScannerActive.value) {
-                ShieldGuardService.startService(application)
-            }
-        }
+        refreshAuditInventory()
     }
 
-    // Refresh Cache
-    fun refreshCacheUsage() {
+    fun refreshAuditInventory() {
         viewModelScope.launch(Dispatchers.IO) {
-            val res = repository.getCalculatedCacheUsage()
-            _cacheState.value = res
+            _isLoadingApps.value = true
+            val blacklist = repository.getBlacklistedHashSet()
+            val trustedSet = repository.trustedApps.first().mapTo(HashSet()) { it.packageName }
+            val apps = repository.auditInstalledApps(_sensitivity.value, blacklist)
+            val posture = repository.inspectDevicePosture(apps, trustedSet)
+
+            _auditedApps.value = apps
+            _postureReport.value = posture
+            _isLoadingApps.value = false
+            ShieldGuardWidgetProvider.updateWidgetScore(getApplication(), posture.score)
         }
     }
 
-    // Refresh Permissions audit list
-    fun refreshAppPermissions() {
-        viewModelScope.launch(Dispatchers.IO) {
-            val list = repository.getInstalledAppsWithPermissions(scannerSensitivity.value)
-            _installedApps.value = list
-        }
-    }
+    fun runQuickAudit() {
+        if (_isScanning.value) return
+        activeScanJob = viewModelScope.launch(Dispatchers.IO) {
+            val start = System.currentTimeMillis()
+            _isScanning.value = true
+            _scanProgress.value = 0.2f
+            _currentScanTarget.value = "Анализ разрешений и параметров ОС..."
 
-    fun setScannerSensitivity(level: String) {
-        scannerSensitivity.value = level
-        refreshAppPermissions()
-    }
+            val blacklist = repository.getBlacklistedHashSet()
+            val trustedSet = repository.trustedApps.first().mapTo(HashSet()) { it.packageName }
+            val apps = repository.auditInstalledApps(_sensitivity.value, blacklist)
+            _scanProgress.value = 0.8f
 
-    // Interactive Cache Clean
-    fun cleanCache() {
-        viewModelScope.launch {
-            _isCleaning.value = true
-            // Simulate clean-up duration
-            delay(1800)
-            val cleared = withContext(Dispatchers.IO) {
-                repository.clearAppCache()
+            val posture = repository.inspectDevicePosture(apps, trustedSet)
+            val duration = (System.currentTimeMillis() - start).coerceAtLeast(1L)
+
+            val flaggedCount = apps.count {
+                (it.isSignatureBlacklisted || (!it.isSystemApp && it.riskScore >= 50)) &&
+                    !trustedSet.contains(it.packageName)
             }
-            _clearedAmount.value = cleared
-            
-            // Add a log of file cache clean-up
+            val blacklistHits = apps.count { it.isSignatureBlacklisted }
+            val status = when {
+                blacklistHits > 0 -> "Найдена угроза"
+                flaggedCount > 0 -> "Есть риски"
+                else -> "Чисто"
+            }
+
             repository.addScanReport(
                 ScanReport(
-                    scanType = "Cache Cleaning",
-                    filesScannedCount = 42,
-                    threatsFoundCount = 0,
-                    cacheCleanedMb = cleared,
-                    isInternetSourced = false,
-                    status = "Cleaned"
+                    scanType = "Быстрый аудит",
+                    appsScannedCount = apps.size,
+                    findingsCount = flaggedCount,
+                    durationMs = duration,
+                    status = status
                 )
             )
 
-            refreshCacheUsage()
-            _isCleaning.value = false
-            ShieldGuardWidgetProvider.forceUpdate(getApplication())
+            _auditedApps.value = apps
+            _postureReport.value = posture
+            _scanProgress.value = 1f
+            _lastScanBanner.value = "Быстрый аудит завершён за ${duration} мс • Приложений: ${apps.size}, рисков: $flaggedCount"
+            _isScanning.value = false
+            ShieldGuardWidgetProvider.updateWidgetScore(getApplication(), posture.score)
         }
     }
 
-    // Interactive Scan
-    fun runScan(isDeep: Boolean) {
+    fun runFullApkHashScan() {
         if (_isScanning.value) return
-        _isScanning.value = true
-        _scanProgress.value = 0f
-        _scannedFilesCount.value = 0
-        _activeThreatsFound.value = emptyList()
+        activeScanJob = viewModelScope.launch(Dispatchers.IO) {
+            val start = System.currentTimeMillis()
+            _isScanning.value = true
+            _scanProgress.value = 0f
+            _scannedCount.value = 0
+            _currentScanTarget.value = "Подготовка списка APK..."
 
-        viewModelScope.launch {
-            val filesToScan = 350 + (if (isDeep) 650 else 0)
-            val stepSize = if (isLowBatteryModeActive.value) 20 else 5 // batch files to save battery & cpu cycles
-            val speedFactor = if (isLowBatteryModeActive.value) 80L else 40L // scan slower/lower CPU draw if optimization active
+            val blacklist = repository.getBlacklistedHashSet()
+            val trustedSet = repository.trustedApps.first().mapTo(HashSet()) { it.packageName }
 
-            val dummyPaths = listOf(
-                "/storage/emulated/0/Download/update_free_vpn.apk",
-                "/storage/emulated/0/Download/system_miner_service.bin",
-                "/storage/emulated/0/Android/data/com.android.chrome/cache/temp.tmp",
-                "/system/bin/app_process",
-                "/storage/emulated/0/DCIM/Camera/IMG_2026.jpg",
-                "/storage/emulated/0/Documents/tax_credentials.xlsx",
-                "/storage/emulated/0/Download/adware_blocker_pro.apk",
-                "/storage/emulated/0/Download/trojan_dropper_stub.exe",
-                "/storage/emulated/0/Pictures/exif_infected.png"
-            )
+            val baseApps = _auditedApps.value.ifEmpty {
+                repository.auditInstalledApps(_sensitivity.value, blacklist)
+            }
+            val userAppCount = baseApps.count { !it.isSystemApp }
+            _totalToScan.value = userAppCount
 
-            var scanned = 0
-            while (scanned < filesToScan) {
-                delay(speedFactor)
-                scanned += stepSize
-                _scannedFilesCount.value = scanned
-                _scanProgress.value = scanned.toFloat() / filesToScan.toFloat()
-
-                // Display file being examined
-                val pathTemplate = dummyPaths[Random.nextInt(dummyPaths.size)]
-                _currentScannedFile.value = "$pathTemplate.${Random.nextInt(100, 999)}"
+            val hashedApps = repository.runFullApkHashScan(
+                currentApps = baseApps,
+                blacklistedHashes = blacklist,
+                sensitivity = _sensitivity.value
+            ) { scanned, total, label ->
+                _scannedCount.value = scanned
+                _totalToScan.value = total
+                _scanProgress.value = if (total > 0) scanned.toFloat() / total.toFloat() else 1f
+                _currentScanTarget.value = label
             }
 
-            // Determine if a threat was found (simulated malware finding to guarantee fully working offline quarantine + alert actions)
-            val foundMalware = mutableListOf<QuarantinedItem>()
-            
-            // Fast scan finds 1, Deep scan finds 2 threats
-            foundMalware.add(
-                QuarantinedItem(
-                    fileName = "adware_booster_block.apk",
-                    filePath = "/storage/emulated/0/Download/adware_booster_block.apk",
-                    threatType = "Adware.Aggressive",
-                    isAutomaticallyRemoved = false,
-                    sizeBytes = 4_512_000
+            val posture = repository.inspectDevicePosture(hashedApps, trustedSet)
+            val duration = (System.currentTimeMillis() - start).coerceAtLeast(1L)
+
+            val blacklistHits = hashedApps.count { it.isSignatureBlacklisted }
+            val flaggedCount = hashedApps.count {
+                (it.isSignatureBlacklisted || (!it.isSystemApp && it.riskScore >= 50)) &&
+                    !trustedSet.contains(it.packageName)
+            }
+            val status = when {
+                blacklistHits > 0 -> "Найдена угроза"
+                flaggedCount > 0 -> "Есть риски"
+                else -> "Чисто"
+            }
+
+            repository.addScanReport(
+                ScanReport(
+                    scanType = "Проверка APK (SHA-256)",
+                    appsScannedCount = userAppCount,
+                    findingsCount = flaggedCount,
+                    durationMs = duration,
+                    status = status
                 )
             )
 
-            if (isDeep) {
-                foundMalware.add(
-                    QuarantinedItem(
-                        fileName = "telegram_spy_agent.bin",
-                        filePath = "/storage/emulated/0/Download/telegram_spy_agent.bin",
-                        threatType = "Spyware.InfoStealer",
-                        isAutomaticallyRemoved = false,
-                        sizeBytes = 1_230_000
+            _auditedApps.value = hashedApps
+            _postureReport.value = posture
+            _scanProgress.value = 1f
+            _lastScanBanner.value = "Проверено $userAppCount APK (SHA-256) за ${duration} мс • Совпадений с базой угроз: $blacklistHits"
+            _isScanning.value = false
+            ShieldGuardWidgetProvider.updateWidgetScore(getApplication(), posture.score)
+        }
+    }
+
+    fun inspectPickedFile(uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            _isInspectingFile.value = true
+            _fileInspectionError.value = null
+            try {
+                val blacklist = repository.getBlacklistedHashSet()
+                val result = repository.inspectFileUri(uri, blacklist)
+                _fileInspectionResult.value = result
+
+                repository.addScanReport(
+                    ScanReport(
+                        scanType = "Инспекция файла",
+                        appsScannedCount = 1,
+                        findingsCount = if (result.isBlacklisted) 1 else 0,
+                        durationMs = result.inspectionDurationMs,
+                        status = if (result.isBlacklisted) "Найдена угроза" else "Чисто"
                     )
                 )
-            }
-
-            _activeThreatsFound.value = foundMalware
-
-            // Write report to DB
-            repository.addScanReport(
-                ScanReport(
-                    scanType = if (isDeep) "Deep Scan" else "Fast Scan",
-                    filesScannedCount = filesToScan,
-                    threatsFoundCount = foundMalware.size,
-                    cacheCleanedMb = 0f,
-                    isInternetSourced = false,
-                    status = if (foundMalware.isNotEmpty()) "Action Required" else "Secure"
-                )
-            )
-
-            _isScanning.value = false
-            
-            // Update Widgets
-            ShieldGuardWidgetProvider.forceUpdate(getApplication())
-        }
-    }
-
-    // Move to Quarantine (manual or automatically triggered)
-    fun quarantineThreat(threat: QuarantinedItem) {
-        viewModelScope.launch {
-            repository.addQuarantine(threat.copy(isAutomaticallyRemoved = true))
-            _activeThreatsFound.value = _activeThreatsFound.value.filter { it.fileName != threat.fileName }
-            
-            // Post notification if alerts are enabled
-            if (isRiskNotificationsEnabled.value) {
-                ShieldGuardService.simulateDownloadScan(
-                    context = getApplication(),
-                    fileName = threat.fileName,
-                    containsVirus = true
-                )
+            } catch (e: Exception) {
+                _fileInspectionError.value = e.localizedMessage ?: "Ошибка чтения файла"
+            } finally {
+                _isInspectingFile.value = false
             }
         }
     }
 
-    // Permanently Delete Quarantined Target File
-    fun deleteQuarantine(item: QuarantinedItem) {
-        viewModelScope.launch {
-            repository.deleteQuarantineItem(item)
-        }
+    fun clearFileInspection() {
+        _fileInspectionResult.value = null
+        _fileInspectionError.value = null
     }
 
-    // Restore File from Quarantine
-    fun restoreQuarantine(item: QuarantinedItem) {
-        viewModelScope.launch {
-            // Remove from Quarantine log
-            repository.removeQuarantine(item.id)
-            
-            // Add a log indicating file restoration
-            repository.addScanReport(
-                ScanReport(
-                    scanType = "File Restoration",
-                    filesScannedCount = 1,
-                    threatsFoundCount = 0,
-                    cacheCleanedMb = 0f,
-                    isInternetSourced = false,
-                    status = "File Restored"
-                )
-            )
-        }
+    fun dismissScanBanner() {
+        _lastScanBanner.value = null
     }
 
-    // Add Blocked Malicious Website
-    fun addWebRule(domain: String) {
-        if (domain.isBlank()) return
-        viewModelScope.launch {
-            repository.addBlockedWebsite(domain.trim().lowercase())
-        }
+    fun setSensitivity(level: SensitivityLevel) {
+        if (_sensitivity.value == level) return
+        _sensitivity.value = level
+        prefs.edit().putString("scanner_sensitivity", level.key).apply()
+        refreshAuditInventory()
     }
 
-    // Remove Blocked Malicious Website
-    fun removeWebRule(website: BlockedWebsite) {
-        viewModelScope.launch {
-            repository.removeBlockedWebsite(website)
-        }
-    }
-
-    // Check custom Domain search simulation
-    private val _webTestResult = MutableStateFlow<String?>(null)
-    val webTestResult = _webTestResult.asStateFlow()
-
-    fun testWebDomain(domain: String) {
-        viewModelScope.launch {
-            val suspicious = repository.isWebsiteSuspicious(domain)
-            _webTestResult.value = if (suspicious) {
-                "🔴 БЛОКИРОВАН: Этот сайт найден в нашей базе вредоносного ПО и рекламных трекеров!"
-            } else {
-                "🟢 БЕЗОПАСЕН: Сайт чист и разрешен в вашем брандмауэре."
-            }
-        }
-    }
-
-    fun clearWebTestResult() {
-        _webTestResult.value = null
-    }
-
-    // Clear history reports completely
-    fun clearAllReports() {
-        viewModelScope.launch {
-            repository.clearReports()
-        }
-    }
-
-    // Toggle real time scanning
-    fun toggleRealTimeScanning(active: Boolean) {
-        isRealTimeScannerActive.value = active
-        val app = getApplication<Application>()
-        if (active) {
-            ShieldGuardService.startService(app)
-        } else {
-            ShieldGuardService.stopService(app)
-        }
-    }
-
-    // Simulations for risk notifications
-    fun runSuspiciousAppTrigger(appName: String, pkg: String) {
-        ShieldGuardService.triggerAppEntranceWarning(getApplication(), appName, pkg)
-    }
-
-    fun runMaliciousDownloadTrigger(fileName: String) {
-        ShieldGuardService.simulateDownloadScan(getApplication(), fileName, containsVirus = true)
-    }
-
-    fun runSafeDownloadTrigger(fileName: String) {
-        ShieldGuardService.simulateDownloadScan(getApplication(), fileName, containsVirus = false)
-    }
-
-    // Trusted Apps whitelist handlers
     fun addTrustedApp(packageName: String, appName: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.addTrustedApp(packageName, appName)
-            refreshAppPermissions()
+            val trustedSet = repository.trustedApps.first().mapTo(HashSet()) { it.packageName }
+            _postureReport.value = repository.inspectDevicePosture(_auditedApps.value, trustedSet)
         }
     }
 
     fun removeTrustedAppByPackage(packageName: String) {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             repository.removeTrustedAppByPackage(packageName)
-            refreshAppPermissions()
+            val trustedSet = repository.trustedApps.first().mapTo(HashSet()) { it.packageName }
+            _postureReport.value = repository.inspectDevicePosture(_auditedApps.value, trustedSet)
         }
     }
 
     fun removeTrustedApp(app: TrustedApp) {
+        removeTrustedAppByPackage(app.packageName)
+    }
+
+    fun clearAllReports() {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.clearReports()
+        }
+    }
+
+    fun updateSignatureDatabase() {
+        if (_isSyncingSignatures.value) return
+        _isSyncingSignatures.value = true
+        _syncError.value = null
+
+        val request = OneTimeWorkRequestBuilder<SignatureUpdateWorker>()
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .build()
+            )
+            .build()
+
+        val wm = WorkManager.getInstance(getApplication())
+        wm.enqueueUniqueWork("SignatureUpdate", ExistingWorkPolicy.REPLACE, request)
+
         viewModelScope.launch {
-            repository.removeTrustedApp(app)
-            refreshAppPermissions()
+            val finalInfo = wm.getWorkInfoByIdFlow(request.id)
+                .first { it != null && it.state.isFinished }
+            when (finalInfo?.state) {
+                WorkInfo.State.SUCCEEDED -> {
+                    _isSyncingSignatures.value = false
+                    _lastSyncTimeMs.value = prefs.getLong(SignatureUpdateWorker.KEY_LAST_SYNC_TIME, System.currentTimeMillis())
+                    _syncError.value = null
+                    refreshAuditInventory()
+                }
+                else -> {
+                    _isSyncingSignatures.value = false
+                    _syncError.value = finalInfo?.outputData?.getString("error")
+                        ?: prefs.getString(SignatureUpdateWorker.KEY_LAST_SYNC_ERROR, null)
+                        ?: "Не удалось загрузить базу сигнатур"
+                }
+            }
         }
     }
 }

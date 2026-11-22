@@ -4,14 +4,13 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import com.example.data.model.BlockedWebsite
-import com.example.data.model.QuarantinedItem
+import com.example.data.model.GlobalBlacklist
 import com.example.data.model.ScanReport
 import com.example.data.model.TrustedApp
 
 @Database(
-    entities = [ScanReport::class, QuarantinedItem::class, BlockedWebsite::class, TrustedApp::class],
-    version = 2,
+    entities = [ScanReport::class, TrustedApp::class, GlobalBlacklist::class],
+    version = 4,
     exportSchema = false
 )
 abstract class ShieldGuardDatabase : RoomDatabase() {
@@ -29,8 +28,8 @@ abstract class ShieldGuardDatabase : RoomDatabase() {
                     ShieldGuardDatabase::class.java,
                     "shield_guard_db"
                 )
-                .fallbackToDestructiveMigration()
-                .build()
+                    .fallbackToDestructiveMigration(dropAllTables = true)
+                    .build()
                 INSTANCE = instance
                 instance
             }

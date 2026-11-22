@@ -1,6 +1,6 @@
 {
   "name": "ShieldGuard",
-  "description": "Premium real-time antivirus, cache cleaner, application permissions monitor, and privacy shield.",
+  "description": "Fast Android security posture auditor, installed app permission inspector, APK SHA-256 verifier, and Abuse.ch signature checker.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
