@@ -48,18 +48,29 @@ class ShieldViewModel(application: Application) : AndroidViewModel(application) 
     private val _isSyncingSignatures = MutableStateFlow(false)
     private val _syncError = MutableStateFlow<String?>(prefs.getString(SignatureUpdateWorker.KEY_LAST_SYNC_ERROR, null))
     private val _lastSyncTimeMs = MutableStateFlow(prefs.getLong(SignatureUpdateWorker.KEY_LAST_SYNC_TIME, 0L))
+    private val _syncSourceName = MutableStateFlow(
+        prefs.getString(SignatureUpdateWorker.KEY_LAST_SYNC_SOURCE, "Public Threat Feed (GitHub)")
+            ?: "Public Threat Feed (GitHub)"
+    )
+
+    private val _abuseChAuthKey = MutableStateFlow(
+        prefs.getString(SignatureUpdateWorker.KEY_ABUSECH_AUTH_KEY, "") ?: ""
+    )
+    val abuseChAuthKey: StateFlow<String> = _abuseChAuthKey.asStateFlow()
 
     val signatureSyncState: StateFlow<SignatureSyncState> = combine(
         repository.blacklistedCount,
         _lastSyncTimeMs,
         _isSyncingSignatures,
-        _syncError
-    ) { count, lastSync, syncing, err ->
+        _syncError,
+        _syncSourceName
+    ) { count, lastSync, syncing, err, source ->
         SignatureSyncState(
             count = count,
             lastSyncTimeMs = lastSync,
             isSyncing = syncing,
-            lastError = err
+            lastError = err,
+            sourceName = source
         )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SignatureSyncState())
 
@@ -303,6 +314,16 @@ class ShieldViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun saveAbuseChAuthKey(key: String) {
+        val cleaned = key.trim()
+        _abuseChAuthKey.value = cleaned
+        if (cleaned.isEmpty()) {
+            prefs.edit().remove(SignatureUpdateWorker.KEY_ABUSECH_AUTH_KEY).apply()
+        } else {
+            prefs.edit().putString(SignatureUpdateWorker.KEY_ABUSECH_AUTH_KEY, cleaned).apply()
+        }
+    }
+
     fun updateSignatureDatabase() {
         if (_isSyncingSignatures.value) return
         _isSyncingSignatures.value = true
@@ -326,6 +347,10 @@ class ShieldViewModel(application: Application) : AndroidViewModel(application) 
                 WorkInfo.State.SUCCEEDED -> {
                     _isSyncingSignatures.value = false
                     _lastSyncTimeMs.value = prefs.getLong(SignatureUpdateWorker.KEY_LAST_SYNC_TIME, System.currentTimeMillis())
+                    _syncSourceName.value = prefs.getString(
+                        SignatureUpdateWorker.KEY_LAST_SYNC_SOURCE,
+                        "Public Threat Feed (GitHub)"
+                    ) ?: "Public Threat Feed (GitHub)"
                     _syncError.value = null
                     refreshAuditInventory()
                 }

@@ -59,12 +59,23 @@ import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+
 @Composable
 fun DatabaseLogsTab(viewModel: ShieldViewModel) {
     val signatureState by viewModel.signatureSyncState.collectAsStateWithLifecycle()
+    val savedAuthKey by viewModel.abuseChAuthKey.collectAsStateWithLifecycle()
     val sensitivity by viewModel.sensitivity.collectAsStateWithLifecycle()
     val trustedApps by viewModel.trustedAppsList.collectAsStateWithLifecycle()
     val reports by viewModel.reportsList.collectAsStateWithLifecycle()
+
+    var showKeyConfig by remember { mutableStateOf(false) }
+    var keyDraft by remember(savedAuthKey) { mutableStateOf(savedAuthKey) }
 
     LazyColumn(
         modifier = Modifier
@@ -73,29 +84,87 @@ fun DatabaseLogsTab(viewModel: ShieldViewModel) {
         verticalArrangement = Arrangement.spacedBy(14.dp),
         contentPadding = PaddingValues(top = 14.dp, bottom = 28.dp)
     ) {
-        // 1. MalwareBazaar Signature Database Sync
+        // 1. Malware Signature Database Sync
         item(key = "signature_db") {
             SecurityCard(borderColor = ShieldCyan.copy(alpha = 0.5f)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.CloudSync, contentDescription = null, tint = ShieldCyan)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "База сигнатур Abuse.ch (SHA-256)",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = TextPrimary
-                    )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.CloudSync, contentDescription = null, tint = ShieldCyan)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "База сигнатур угроз (SHA-256)",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TextPrimary
+                        )
+                    }
+                    TextButton(onClick = { showKeyConfig = !showKeyConfig }) {
+                        Text(
+                            text = if (savedAuthKey.isNotEmpty()) "API Key ✓" else "API Key",
+                            color = ShieldCyan,
+                            fontSize = 11.sp
+                        )
+                    }
                 }
-                Spacer(modifier = Modifier.height(8.dp))
+                Spacer(modifier = Modifier.height(6.dp))
                 Text(
                     text = "Локальных хешей: ${signatureState.count}",
                     style = MaterialTheme.typography.titleSmall,
                     color = if (signatureState.count > 0) ShieldEmerald else ShieldAmber
                 )
                 Text(
+                    text = "Источник: ${if (savedAuthKey.isNotEmpty()) "Abuse.ch API v1 (Auth-Key)" else signatureState.sourceName}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextSecondary
+                )
+                Text(
                     text = "Последнее обновление: ${formatTimestamp(signatureState.lastSyncTimeMs)}",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary
                 )
+
+                if (showKeyConfig) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = keyDraft,
+                        onValueChange = { keyDraft = it },
+                        label = { Text("Abuse.ch Auth-Key (необязательно)", fontSize = 12.sp) },
+                        placeholder = { Text("Без ключа используется публичный фид GitHub", fontSize = 11.sp) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        shape = RoundedCornerShape(10.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = ShieldCyan,
+                            unfocusedBorderColor = ShieldOutline,
+                            focusedTextColor = TextPrimary,
+                            unfocusedTextColor = TextPrimary
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        TextButton(onClick = {
+                            keyDraft = ""
+                            viewModel.saveAbuseChAuthKey("")
+                            showKeyConfig = false
+                        }) {
+                            Text("Сбросить", color = TextSecondary, fontSize = 12.sp)
+                        }
+                        TextButton(onClick = {
+                            viewModel.saveAbuseChAuthKey(keyDraft)
+                            showKeyConfig = false
+                        }) {
+                            Text("Сохранить ключ", color = ShieldEmerald, fontSize = 12.sp)
+                        }
+                    }
+                }
+
                 signatureState.lastError?.let { err ->
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
@@ -125,7 +194,7 @@ fun DatabaseLogsTab(viewModel: ShieldViewModel) {
                             color = ShieldObsidian
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Загрузка с MalwareBazaar...", fontWeight = FontWeight.Bold)
+                        Text("Загрузка хешей угроз...", fontWeight = FontWeight.Bold)
                     } else {
                         Text("Обновить базу сигнатур", fontWeight = FontWeight.Bold)
                     }

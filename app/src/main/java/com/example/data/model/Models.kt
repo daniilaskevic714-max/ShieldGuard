@@ -123,5 +123,6 @@ data class SignatureSyncState(
     val count: Int = 0,
     val lastSyncTimeMs: Long = 0L,
     val isSyncing: Boolean = false,
-    val lastError: String? = null
+    val lastError: String? = null,
+    val sourceName: String = "Public Threat Feed (GitHub)"
 )
